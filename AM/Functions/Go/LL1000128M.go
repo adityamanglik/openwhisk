@@ -35,9 +35,13 @@ func init() {
 		panic(err)
 	}
 
-	// Set GOMEMLIMIT, an example environment variable. This is not standard in Go.
-	// You'll need to implement its usage logic within your application.
+	// Set GOMEMLIMIT
 	if err := os.Setenv("GOMEMLIMIT", "128M"); err != nil {
+		panic(err)
+	}
+
+	// Set GOMAXPROCS for serial GC
+	if err := os.Setenv("GOMAXPROCS", "1"); err != nil {
 		panic(err)
 	}
 }
