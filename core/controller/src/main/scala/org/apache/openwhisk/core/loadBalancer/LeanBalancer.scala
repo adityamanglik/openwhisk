@@ -58,7 +58,10 @@ class LeanBalancer(config: WhiskConfig,
   /** 1. Publish a message to the loadbalancer */
   override def publish(action: ExecutableWhiskActionMetaData, msg: ActivationMessage)(
     implicit transid: TransactionId): Future[Future[Either[ActivationId, WhiskActivation]]] = {
-
+    logging.info(this, s"AM says hello")
+    logging.info(this, s"******************************************************************************")
+    logging.info(this, s"Publishing message: $msg ")
+    logging.info(this, s"******************************************************************************")
     /** 2. Update local state with the activation to be executed scheduled. */
     val activationResult = setupActivation(msg, action, invokerName)
     sendActivationToInvoker(messageProducer, msg, invokerName).map(_ => activationResult)
