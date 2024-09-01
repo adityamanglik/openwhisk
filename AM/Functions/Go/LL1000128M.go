@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"math"
 	"math/rand"
-	"net/url"
 	"os"
 	"runtime"
 	"strconv"
@@ -48,30 +47,26 @@ func init() {
 
 // Main is the function implementing the OpenWhisk action
 func Main(obj map[string]interface{}) map[string]interface{} {
-	seed := 42               // default seed value
-	ARRAY_SIZE := 10000      // default array size value
-	REQ_NUM := math.MaxInt32 // default request number
+	// Default values
+	seed := 42
+	ARRAY_SIZE := 10000
+	REQ_NUM := math.MaxInt32
 	response := Response{}
 
-	// Parse query parameters if provided
-	if query, ok := obj["__ow_query"].(string); ok && query != "" {
-		response.ParsedSeed = "Found query, seed not parsed"
-		response.ParsedArraySize = "Found query, arraysize not parsed"
-		response.ParsedReqNum = "Found query, requestnumber not parsed"
-		values, err := url.ParseQuery(query)
-		if err == nil {
-			if val, ok := values["seed"]; ok {
-				seed, _ = strconv.Atoi(val[0])
-			}
+	// Extract parameters directly from the obj map
+	if seedVal, ok := obj["seed"].(string); ok {
+		seed, _ = strconv.Atoi(seedVal)
+		response.ParsedSeed = seedVal
+	}
 
-			if val, ok := values["arraysize"]; ok {
-				ARRAY_SIZE, _ = strconv.Atoi(val[0])
-			}
+	if arraySizeVal, ok := obj["arraysize"].(string); ok {
+		ARRAY_SIZE, _ = strconv.Atoi(arraySizeVal)
+		response.ParsedArraySize = arraySizeVal
+	}
 
-			if val, ok := values["requestnumber"]; ok {
-				REQ_NUM, _ = strconv.Atoi(val[0])
-			}
-		}
+	if reqNumVal, ok := obj["requestnumber"].(string); ok {
+		REQ_NUM, _ = strconv.Atoi(reqNumVal)
+		response.ParsedReqNum = reqNumVal
 	}
 
 	start := time.Now()
