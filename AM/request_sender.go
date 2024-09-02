@@ -2,16 +2,20 @@ package main
 
 // Import the required packages
 import (
+	"bytes"
 	"encoding/csv"
 	"encoding/json"
 	"fmt"
 	"image/color"
 	"io/ioutil"
+	"log"
 	"math/rand"
 	"net/http"
 	"os"
+	"os/exec"
 	"sort"
 	"strconv"
+	"strings"
 	"time"
 
 	"gonum.org/v1/gonum/stat"
@@ -26,12 +30,15 @@ var actualIterations int = 1000
 // Constants for API endpoints and file names
 const (
 	javaAPI               = "http://node0:8180/java"
-	goAPI                 = "http://node0:9501/GoNative"
+	goAPI                 = "http://172.17.0.1:3234/api/23bc46b1-71f6-4ed5-8c54-816aa4f8c502/GoLL"
 	javaResponseTimesFile = "java_response_times.txt"
 	goResponseTimesFile   = "go_response_times.txt"
 	javaServerTimesFile   = "java_server_times.txt"
 	goServerTimesFile     = "go_server_times.txt"
 	goHeapFile            = "go_heap_memory.log"
+	sshUser               = "am_CU"
+	sshHost               = "node0"
+	sshCommand            = "docker logs $(docker ps -q --filter ancestor=openwhisk/action-golang-v1.20:nightly)"
 )
 
 // Response structure for unmarshalling JSON data
@@ -57,7 +64,6 @@ func main() {
 	fmt.Printf("\nArraysize: %d\n", arraysize)
 	// ensure server is alive
 	checkServerAlive(goAPI)
-	// javaResponseTimes, javaServerTimes := sendRequests(javaAPI)
 	// Warm up
 	goResponseTimes, goServerTimes, heapSizes := sendRequests(goAPI, arraysize)
 	iterations = actualIterations
@@ -65,55 +71,52 @@ func main() {
 	// Actual measurements
 	goResponseTimes, goServerTimes, heapSizes = sendRequests(goAPI, arraysize)
 	_ = plotTimes(goResponseTimes, heapSizes, fmt.Sprintf("Server Times for Arraysize %d", arraysize))
-	// _ = plotTimes(goResponseTimes, fmt.Sprintf("Server Times for Arraysize %d", arraysize))
-	// fmt.Printf("Problem plots done, starting SLA run\n")
-	// iterations = 100000
-	// arraysize = 10000
-	// SLA measurements
-	// goResponseTimes, goServerTimes, heapSizes = sendRequests(goAPI, arraysize)
-	// _ = plotSLA(goResponseTimes)
 	writeTimesToFile(goResponseTimesFile, goResponseTimes)
 	writeTimesToFile(goServerTimesFile, goServerTimes)
 	writeTimesToFile(goHeapFile, heapSizes)
 
-	// calculateAndPrintStats(goResponseTimes, "Go Response Times")
-	// calculateAndPrintStats(goServerTimes, "Go Server Times")
-	// filePath := fmt.Sprintf("./Graphs/Go/%d/latencies.csv", arraysize)
-	// err = latencyAnalysis2(filePath, arraysize, goResponseTimes, goServerTimes)
-	// if err != nil {
-	// fmt.Println("Error writing to CSV:", err)
-	// }
-
-	// // ensure server is alive
-	// checkServerAlive(javaAPI)
-	// // javaResponseTimes, javaServerTimes := sendRequests(javaAPI)
-	// javaResponseTimes, javaServerTimes := sendRequests(javaAPI, arraysize)
-
-	// // Write time data to files
-	// writeTimesToFile(javaResponseTimesFile, javaResponseTimes)
-	// writeTimesToFile(javaServerTimesFile, javaServerTimes)
-	// // calculateAndPrintStats(javaResponseTimes, "Java Response Times")
-	// // calculateAndPrintStats(javaServerTimes, "Java Server Times")
-	// filePath = fmt.Sprintf("../Graphs/GCScheduler/Java/%d/latencies.csv", arraysize)
-	// err = writeToCSV(filePath, arraysize, javaResponseTimes, javaServerTimes)
-	// if err != nil {
-	//     fmt.Println("Error writing to CSV:", err)
-	// }
+	// Analyze OpenWhisk logs to count requests per container
+	containerRequestCounts := getContainerRequestCounts()
+	for container, count := range containerRequestCounts {
+		fmt.Printf("Container %s served %d requests\n", container, count)
+	}
 }
 
-// string labels instead of numeric values.
-type customTicks struct{}
-
-// Ticks returns Ticks in the specified range.
-func (customTicks) Ticks(min, max float64) []plot.Tick {
-	// Define the labels and their positions
-	labels := []string{"50th", "90th", "95th", "99th", "99.9th", "99.99th", "99.999th"}
-	ticks := make([]plot.Tick, len(labels))
-	for i, label := range labels {
-		ticks[i].Value = float64(i) // Position of the tick
-		ticks[i].Label = label
+func getContainerRequestCounts() map[string]int {
+	sshCmd := exec.Command("ssh", fmt.Sprintf("%s@%s", sshUser, sshHost), sshCommand)
+	var out bytes.Buffer
+	sshCmd.Stdout = &out
+	err := sshCmd.Run()
+	if err != nil {
+		log.Fatalf("Failed to execute SSH command: %v", err)
 	}
-	return ticks
+
+	logData := out.String()
+	containerCounts := make(map[string]int)
+
+	// Parse logs and count requests per container
+	lines := strings.Split(logData, "\n")
+	for _, line := range lines {
+		if strings.Contains(line, "activationId") {
+			// Extract container ID or name
+			containerID := extractContainerID(line)
+			if containerID != "unknown" {
+				containerCounts[containerID]++
+			}
+		}
+	}
+	return containerCounts
+}
+
+func extractContainerID(logLine string) string {
+	// Example log line: "Container wsk0_5_guest_GoLL started"
+	parts := strings.Split(logLine, " ")
+	for _, part := range parts {
+		if strings.HasPrefix(part, "wsk") {
+			return part
+		}
+	}
+	return "unknown"
 }
 
 func plotSLA(times []int64) error {
@@ -131,7 +134,6 @@ func plotSLA(times []int64) error {
 	p.Title.Text = "Server Response Time Percentiles"
 	p.X.Label.Text = "Percentile"
 	p.Y.Label.Text = "Time (microseconds)"
-	// p.X.Tick.Marker = customTicks{} // Use custom tick marks
 
 	// Define percentiles to plot
 	percentiles := []float64{0.50, 0.90, 0.95, 0.99, 0.999, 0.9999, 0.99999}
@@ -149,7 +151,6 @@ func plotSLA(times []int64) error {
 	if err != nil {
 		return err
 	}
-	// scatter.GlyphStyle.Color = color.RGBA{R: 255, A: 255} // Set color to red
 	scatter.GlyphStyle.Radius = vg.Points(3) // Set point size
 	p.Add(scatter)
 
@@ -214,7 +215,6 @@ func sendRequests(apiURL string, arraysize int) ([]int64, []int64, []int64) {
 	var heapSizes []int64
 
 	for i := 0; i < iterations; i++ {
-		// fmt.Printf("Sent request: %d\n", i)
 		seed := rand.Intn(10000) // Example seed generation
 		requestURL1 := fmt.Sprintf("%s?seed=%d", apiURL, seed)
 		requestURL2 := fmt.Sprintf("%s&arraysize=%d", requestURL1, arraysize)
@@ -287,7 +287,6 @@ func checkServerAlive(apiURL string) {
 	}
 }
 
-// Function to log time values to a file
 func writeTimesToFile(filename string, times []int64) {
 	file, err := os.OpenFile(filename, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
 	if err != nil {
