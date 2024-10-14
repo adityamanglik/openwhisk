@@ -505,28 +505,24 @@ class ContainerProxy(factory: (TransactionId,
     case _ => delay
   }
 
-  when(Ready, stateTimeout = pauseGrace) {
-    case Event(job: Run, data: WarmedData) =>
-      implicit val transid = job.msg.transid
-      activeCount += 1
-      val newData = data.withResumeRun(job)
-      initializeAndRun(data.container, job, true)
-        .map(_ => RunCompleted)
-        .pipeTo(self)
+when(Ready) {
+  case Event(StateTimeout, data: WarmedData) =>
+    // Do not transition to Pausing state due to idle timeout
+    stay
 
-      goto(Running) using newData
+  case Event(Remove, _) =>
+    // Ignore remove messages
+    stay
 
-    // pause grace timed out
-    case Event(StateTimeout, data: WarmedData) =>
-      data.container.suspend()(TransactionId.invokerNanny).map(_ => ContainerPaused).pipeTo(self)
-      goto(Pausing)
+  case Event(r: Run, data: WarmedData) =>
+    implicit val transid = r.msg.transid
+    activeCount += 1
+    initializeAndRun(data.container, r)
+      .map(_ => RunCompleted)
+      .pipeTo(self)
+    goto(Running) using data
+}
 
-    case Event(Remove, data: WarmedData) => destroyContainer(data, true)
-
-    // warm container failed
-    case Event(_: FailureMessage, data: WarmedData) =>
-      destroyContainer(data, true)
-  }
 
   when(Pausing) {
     case Event(ContainerPaused, data: WarmedData)   => goto(Paused)

@@ -28,6 +28,7 @@ import scala.annotation.tailrec
 import scala.collection.immutable
 import scala.concurrent.duration._
 import scala.util.{Random, Try}
+import java.time.Instant
 
 case class ColdStartKey(kind: String, memory: ByteSize)
 
@@ -81,6 +82,9 @@ class ContainerPool(childFactory: ActorRefFactory => ActorRef,
   // Key is ColdStartKey, value is the number of cold Start in minute
   var coldStartCount = immutable.Map.empty[ColdStartKey, Int]
 
+  // Map to store the container assigned to each action
+  var actionContainers = immutable.Map.empty[FullyQualifiedEntityName, (ActorRef, ContainerData)]
+
   adjustPrewarmedContainer(true, false)
 
   // check periodically, adjust prewarmed container(delete if unused for some time and create some increment containers)
@@ -120,150 +124,43 @@ class ContainerPool(childFactory: ActorRefFactory => ActorRef,
     // their requests and send them back to the pool for rescheduling (this may happen if "docker" operations
     // fail for example, or a container has aged and was destroying itself when a new request was assigned)
     case r: Run =>
-      // Check if the message is resent from the buffer. Only the first message on the buffer can be resent.
-      val isResentFromBuffer = runBuffer.nonEmpty && runBuffer.dequeueOption.exists(_._1.msg == r.msg)
+        val actionName = r.action.fullyQualifiedName(false)
 
-      // Only process request, if there are no other requests waiting for free slots, or if the current request is the
-      // next request to process
-      // It is guaranteed, that only the first message on the buffer is resent.
-      if (runBuffer.isEmpty || isResentFromBuffer) {
-        if (isResentFromBuffer) {
-          //remove from resent tracking - it may get resent again, or get processed
-          resent = None
-        }
-        val kind = r.action.exec.kind
-        val memory = r.action.limits.memory.megabytes.MB
-
-        val createdContainer =
-          // Schedule a job to a warm container
-          ContainerPool
-            .schedule(r.action, r.msg.user.namespace.name, freePool)
-            .map(container => (container, container._2.initingState)) //warmed, warming, and warmingCold always know their state
-            .orElse(
-              // There was no warm/warming/warmingCold container. Try to take a prewarm container or a cold container.
-              // When take prewarm container, has no need to judge whether user memory is enough
-              takePrewarmContainer(r.action)
-                .map(container => (container, "prewarmed"))
-                .orElse {
-                  // Is there enough space to create a new container or do other containers have to be removed?
-                  if (hasPoolSpaceFor(busyPool ++ freePool ++ prewarmedPool, prewarmStartingPool, memory)) {
-                    val container = Some(createContainer(memory), "cold")
-                    incrementColdStartCount(kind, memory)
-                    container
-                  } else None
-                })
-            .orElse(
-              // Remove a container and create a new one for the given job
-              ContainerPool
-              // Only free up the amount, that is really needed to free up
-                .remove(freePool, Math.min(r.action.limits.memory.megabytes, memoryConsumptionOf(freePool)).MB)
-                .map(removeContainer)
-                // If the list had at least one entry, enough containers were removed to start the new container. After
-                // removing the containers, we are not interested anymore in the containers that have been removed.
-                .headOption
-                .map(_ =>
-                  takePrewarmContainer(r.action)
-                    .map(container => (container, "recreatedPrewarm"))
-                    .getOrElse {
-                      val container = (createContainer(memory), "recreated")
-                      incrementColdStartCount(kind, memory)
-                      container
-                  }))
-
-        createdContainer match {
-          case Some(((actor, data), containerState)) =>
-            //increment active count before storing in pool map
-            val newData = data.nextRun(r)
-            val container = newData.getContainer
-
-            if (newData.activeActivationCount < 1) {
-              logging.error(this, s"invalid activation count < 1 ${newData}")
-            }
-
-            //only move to busyPool if max reached
-            if (!newData.hasCapacity()) {
-              if (r.action.limits.concurrency.maxConcurrent > 1) {
-                logging.info(
-                  this,
-                  s"container ${container} is now busy with ${newData.activeActivationCount} activations")
-              }
-              busyPool = busyPool + (actor -> newData)
-              freePool = freePool - actor
-            } else {
-              //update freePool to track counts
-              freePool = freePool + (actor -> newData)
-            }
-            // Remove the action that was just executed from the buffer and execute the next one in the queue.
-            if (isResentFromBuffer) {
-              // It is guaranteed that the currently executed messages is the head of the queue, if the message comes
-              // from the buffer
-              val (_, newBuffer) = runBuffer.dequeue
-              runBuffer = newBuffer
-              // Try to process the next item in buffer (or get another message from feed, if buffer is now empty)
-              processBufferOrFeed()
-            }
-            actor ! r // forwards the run request to the container
-            logContainerStart(r, containerState, newData.activeActivationCount, container)
+        // Check if a container already exists for this action
+        actionContainers.get(actionName) match {
+          case Some((actorRef, containerData)) =>
+            // Container exists, update its state and send activation
+            val newData = containerData.nextRun(r)
+            actionContainers = actionContainers + (actionName -> (actorRef, newData))
+            actorRef ! r
+            logContainerStart(r, "existing", newData.activeActivationCount, newData.getContainer)
           case None =>
-            // this can also happen if createContainer fails to start a new container, or
-            // if a job is rescheduled but the container it was allocated to has not yet destroyed itself
-            // (and a new container would over commit the pool)
-            val isErrorLogged = r.retryLogDeadline.map(_.isOverdue).getOrElse(true)
-            val retryLogDeadline = if (isErrorLogged) {
-              logging.warn(
-                this,
-                s"Rescheduling Run message, too many message in the pool, " +
-                  s"freePoolSize: ${freePool.size} containers and ${memoryConsumptionOf(freePool)} MB, " +
-                  s"busyPoolSize: ${busyPool.size} containers and ${memoryConsumptionOf(busyPool)} MB, " +
-                  s"maxContainersMemory ${poolConfig.userMemory.toMB} MB, " +
-                  s"userNamespace: ${r.msg.user.namespace.name}, action: ${r.action}, " +
-                  s"needed memory: ${r.action.limits.memory.megabytes} MB, " +
-                  s"waiting messages: ${runBuffer.size}")(r.msg.transid)
-              MetricEmitter.emitCounterMetric(LoggingMarkers.CONTAINER_POOL_RESCHEDULED_ACTIVATION)
-              Some(logMessageInterval.fromNow)
-            } else {
-              r.retryLogDeadline
-            }
-            if (!isResentFromBuffer) {
-              // Add this request to the buffer, as it is not there yet.
-              runBuffer = runBuffer.enqueue(Run(r.action, r.msg, retryLogDeadline))
-            }
-          //buffered items will be processed via processBufferOrFeed()
+            // No container exists, create a new one
+            val memory = r.action.limits.memory.megabytes.MB
+            val (actorRef, containerData) = createContainer(memory)
+            val newData = containerData.nextRun(r)
+            actionContainers = actionContainers + (actionName -> (actorRef, newData))
+            actorRef ! r
+            logContainerStart(r, "cold", newData.activeActivationCount, newData.getContainer)
         }
-      } else {
-        // There are currently actions waiting to be executed before this action gets executed.
-        // These waiting actions were not able to free up enough memory.
-        runBuffer = runBuffer.enqueue(r)
-      }
 
-    // Container is free to take more work
-    case NeedWork(warmData: WarmedData) =>
-      val oldData = freePool.get(sender()).getOrElse(busyPool(sender()))
-      val newData =
-        warmData.copy(lastUsed = oldData.lastUsed, activeActivationCount = oldData.activeActivationCount - 1)
-      if (newData.activeActivationCount < 0) {
-        logging.error(this, s"invalid activation count after warming < 1 ${newData}")
-      }
-      if (newData.hasCapacity()) {
-        //remove from busy pool (may already not be there), put back into free pool (to update activation counts)
-        freePool = freePool + (sender() -> newData)
-        if (busyPool.contains(sender())) {
-          busyPool = busyPool - sender()
-          if (newData.action.limits.concurrency.maxConcurrent > 1) {
-            logging.info(
-              this,
-              s"concurrent container ${newData.container} is no longer busy with ${newData.activeActivationCount} activations")
-          }
-        }
-      } else {
-        busyPool = busyPool + (sender() -> newData)
-        freePool = freePool - sender()
-      }
-      processBufferOrFeed()
-    // Container is prewarmed and ready to take work
-    case NeedWork(data: PreWarmedData) =>
-      prewarmStartingPool = prewarmStartingPool - sender()
-      prewarmedPool = prewarmedPool + (sender() -> data)
+        // Process the next item in the buffer or feed
+        processBufferOrFeed()
+
+      // Container is free to take more work
+          case NeedWork(containerData) =>
+            containerData match {
+              case data: WarmedData =>
+                handleNeedWork(data)
+              case data: WarmingData =>
+                handleNeedWork(data)
+              case data: WarmingColdData =>
+                handleNeedWork(data)
+              case _ =>
+                logging.warn(this, s"Received NeedWork with unexpected containerData type: ${containerData.getClass}")
+            }
+        processBufferOrFeed()
+
 
     // Container got removed
     case ContainerRemoved(replacePrewarm) =>
@@ -309,6 +206,45 @@ class ContainerPool(childFactory: ActorRefFactory => ActorRef,
     case AdjustPrewarmedContainer =>
       adjustPrewarmedContainer(false, true)
   }
+
+// Helper method to handle containerData types with 'action'
+def handleNeedWork(data: ContainerData): Unit = {
+  val actionNameOpt = data match {
+    case d: WarmedData        => Some(d.action.fullyQualifiedName(false))
+    case d: WarmingData       => Some(d.action.fullyQualifiedName(false))
+    case d: WarmingColdData   => Some(d.action.fullyQualifiedName(false))
+    case _ =>
+      logging.warn(this, s"Unexpected containerData type in handleNeedWork: ${data.getClass}")
+      None
+  }
+
+  actionNameOpt.foreach { actionName =>
+    actionContainers.get(actionName).foreach {
+      case (actorRef, existingData) if actorRef == sender() =>
+        val newData = existingData match {
+          case warmData: WarmedData =>
+            warmData.copy(
+              lastUsed = Instant.now,
+              activeActivationCount = warmData.activeActivationCount - 1
+            )
+          case warmingData: WarmingData =>
+            warmingData.copy(
+              activeActivationCount = warmingData.activeActivationCount - 1
+            )
+          case warmingColdData: WarmingColdData =>
+            warmingColdData.copy(
+              activeActivationCount = warmingColdData.activeActivationCount - 1
+            )
+          case _ =>
+            logging.warn(this, s"Received NeedWork with unexpected existingData type: ${existingData.getClass}")
+            existingData
+        }
+        actionContainers = actionContainers + (actionName -> (actorRef, newData))
+      case _ =>
+        logging.warn(this, s"Received NeedWork with mismatched containerData in actionContainers")
+    }
+  }
+}
 
   /** Resend next item in the buffer, or trigger next item in the feed, if no items in the buffer. */
   def processBufferOrFeed() = {

@@ -1,7 +1,7 @@
 # Create and run actions
 wsk action create GoLL LL1000128M.go --web true --concurrency 1
 wsk action update GoLL LL1000128M.go --annotation exec.containers.max 1 --annotation exec.concurrent.max 1
-wsk action update GoLL LL1000128M.go --annotation concurrency 1
+wsk action update GoLL LL1000128M.go --annotation concurrency 1 --timeout 120000
 # wsk action update GoLL LL1000128M.go --memory 128
 wsk api create /GoLL get GoLL --response-type json
 
