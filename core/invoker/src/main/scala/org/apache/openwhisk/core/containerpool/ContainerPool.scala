@@ -83,7 +83,7 @@ class ContainerPool(childFactory: ActorRefFactory => ActorRef,
   var coldStartCount = immutable.Map.empty[ColdStartKey, Int]
 
   // Map to store the container assigned to each action
-  var actionContainers = immutable.Map.empty[FullyQualifiedEntityName, (ActorRef, ContainerData)]
+  var actionContainers = immutable.Map.empty[FullyQualifiedEntityName, (immutable.List[(ActorRef, ContainerData)], Int)]
 
   adjustPrewarmedContainer(true, false)
 
@@ -124,25 +124,32 @@ class ContainerPool(childFactory: ActorRefFactory => ActorRef,
     // their requests and send them back to the pool for rescheduling (this may happen if "docker" operations
     // fail for example, or a container has aged and was destroying itself when a new request was assigned)
     case r: Run =>
-        val actionName = r.action.fullyQualifiedName(false)
+      val actionName = r.action.fullyQualifiedName(false)
 
-        // Check if a container already exists for this action
-        actionContainers.get(actionName) match {
-          case Some((actorRef, containerData)) =>
-            // Container exists, update its state and send activation
-            val newData = containerData.nextRun(r)
-            actionContainers = actionContainers + (actionName -> (actorRef, newData))
-            actorRef ! r
-            logContainerStart(r, "existing", newData.activeActivationCount, newData.getContainer)
-          case None =>
-            // No container exists, create a new one
-            val memory = r.action.limits.memory.megabytes.MB
-            val (actorRef, containerData) = createContainer(memory)
-            val newData = containerData.nextRun(r)
-            actionContainers = actionContainers + (actionName -> (actorRef, newData))
-            actorRef ! r
-            logContainerStart(r, "cold", newData.activeActivationCount, newData.getContainer)
-        }
+      // Access and update actionContainers in a thread-safe manner within the actor
+      actionContainers.get(actionName) match {
+        case Some((containers, nextIndex)) =>
+          val (actorRef, containerData) = containers(nextIndex)
+          val newData = containerData.nextRun(r)
+          val updatedContainers = containers.updated(nextIndex, (actorRef, newData))
+          val updatedNextIndex = (nextIndex + 1) % 2
+          actionContainers = actionContainers.updated(actionName, (updatedContainers, updatedNextIndex))
+          actorRef ! r
+          logContainerStart(r, "existing", newData.activeActivationCount, newData.getContainer)
+        case None =>
+          // Create two new containers
+          val memory = r.action.limits.memory.megabytes.MB
+          val container1 = createContainer(memory)
+          val container2 = createContainer(memory)
+          val containers = immutable.List(container1, container2)
+          // Start with the first container
+          val (actorRef, containerData) = containers(0)
+          val newData = containerData.nextRun(r)
+          val updatedContainers = containers.updated(0, (actorRef, newData))
+          actionContainers = actionContainers.updated(actionName, (updatedContainers, 1)) // Next index is 1
+          actorRef ! r
+          logContainerStart(r, "cold", newData.activeActivationCount, newData.getContainer)
+      }
 
         // Process the next item in the buffer or feed
         processBufferOrFeed()
@@ -210,9 +217,9 @@ class ContainerPool(childFactory: ActorRefFactory => ActorRef,
 // Helper method to handle containerData types with 'action'
 def handleNeedWork(data: ContainerData): Unit = {
   val actionNameOpt = data match {
-    case d: WarmedData        => Some(d.action.fullyQualifiedName(false))
-    case d: WarmingData       => Some(d.action.fullyQualifiedName(false))
-    case d: WarmingColdData   => Some(d.action.fullyQualifiedName(false))
+    case d: WarmedData      => Some(d.action.fullyQualifiedName(false))
+    case d: WarmingData     => Some(d.action.fullyQualifiedName(false))
+    case d: WarmingColdData => Some(d.action.fullyQualifiedName(false))
     case _ =>
       logging.warn(this, s"Unexpected containerData type in handleNeedWork: ${data.getClass}")
       None
@@ -220,28 +227,34 @@ def handleNeedWork(data: ContainerData): Unit = {
 
   actionNameOpt.foreach { actionName =>
     actionContainers.get(actionName).foreach {
-      case (actorRef, existingData) if actorRef == sender() =>
-        val newData = existingData match {
-          case warmData: WarmedData =>
-            warmData.copy(
-              lastUsed = Instant.now,
-              activeActivationCount = warmData.activeActivationCount - 1
-            )
-          case warmingData: WarmingData =>
-            warmingData.copy(
-              activeActivationCount = warmingData.activeActivationCount - 1
-            )
-          case warmingColdData: WarmingColdData =>
-            warmingColdData.copy(
-              activeActivationCount = warmingColdData.activeActivationCount - 1
-            )
-          case _ =>
-            logging.warn(this, s"Received NeedWork with unexpected existingData type: ${existingData.getClass}")
-            existingData
+      case (containers, nextIndex) =>
+        // Find the container in the list
+        val index = containers.indexWhere { case (actorRef, _) => actorRef == sender() }
+        if (index >= 0) {
+          val (actorRef, existingData) = containers(index)
+          val newData = existingData match {
+            case warmData: WarmedData =>
+              warmData.copy(
+                lastUsed = Instant.now,
+                activeActivationCount = warmData.activeActivationCount - 1
+              )
+            case warmingData: WarmingData =>
+              warmingData.copy(
+                activeActivationCount = warmingData.activeActivationCount - 1
+              )
+            case warmingColdData: WarmingColdData =>
+              warmingColdData.copy(
+                activeActivationCount = warmingColdData.activeActivationCount - 1
+              )
+            case _ =>
+              logging.warn(this, s"Received NeedWork with unexpected existingData type: ${existingData.getClass}")
+              existingData
+          }
+          val updatedContainers = containers.updated(index, (actorRef, newData))
+          actionContainers = actionContainers + (actionName -> (updatedContainers, nextIndex))
+        } else {
+          logging.warn(this, s"Received NeedWork with mismatched containerData in actionContainers")
         }
-        actionContainers = actionContainers + (actionName -> (actorRef, newData))
-      case _ =>
-        logging.warn(this, s"Received NeedWork with mismatched containerData in actionContainers")
     }
   }
 }

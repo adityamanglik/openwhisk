@@ -25,6 +25,7 @@ type Response struct {
 	ParsedSeed      string `json:"parsedSeed,omitempty"`
 	ParsedArraySize string `json:"parsedArraySize,omitempty"`
 	ParsedReqNum    string `json:"parsedReqNum,omitempty"`
+	ContainerID     string `json:"containerId"`
 }
 
 // init function to set up environment variables
@@ -119,6 +120,12 @@ func Main(obj map[string]interface{}) map[string]interface{} {
 	response.GOMEMLIMIT = os.Getenv("GOMEMLIMIT")
 	response.NextGC = m.NextGC
 	response.NumGC = m.NumGC
+
+	hostname, err := os.Hostname()
+	if err != nil {
+		hostname = "unknown"
+	}
+	response.ContainerID = hostname
 
 	// Convert the response to a map for OpenWhisk
 	responseMap := make(map[string]interface{})
