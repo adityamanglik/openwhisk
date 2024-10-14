@@ -17,7 +17,7 @@ type Response struct {
 	ExecutionTime   int64  `json:"executionTime"`
 	RequestNumber   int    `json:"requestNumber"`
 	ArraySize       int    `json:"arraysize"`
-	HeapAllocMemory uint64 `json:"heapAllocMemory"`
+	HeapAllocMemory uint64 `json:"heapAlloc"`
 	GOGC            string `json:"GOGC"`
 	GOMEMLIMIT      string `json:"GOMEMLIMIT"`
 	NextGC          uint64 `json:"NextGC"`
