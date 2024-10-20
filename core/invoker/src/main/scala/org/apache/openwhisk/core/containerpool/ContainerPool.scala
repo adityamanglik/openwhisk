@@ -63,6 +63,9 @@ class ContainerPool(childFactory: ActorRefFactory => ActorRef,
     extends Actor {
   import ContainerPool.memoryConsumptionOf
 
+  // Scheduling Policy
+  val schedulingPolicy: String = "SingleContainer"
+
   implicit val ec = context.dispatcher
 
   var freePool = immutable.Map.empty[ActorRef, ContainerData]

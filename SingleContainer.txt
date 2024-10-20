@@ -1,0 +1,428 @@
+diff --git a/AM/Scripts/openwhisk_actions_setup.sh b/AM/Scripts/openwhisk_actions_setup.sh
+index 7c48c638..42038873 100644
+--- a/AM/Scripts/openwhisk_actions_setup.sh
++++ b/AM/Scripts/openwhisk_actions_setup.sh
+@@ -1,7 +1,7 @@
+ # Create and run actions
+ wsk action create GoLL LL1000128M.go --web true --concurrency 1
+ wsk action update GoLL LL1000128M.go --annotation exec.containers.max 1 --annotation exec.concurrent.max 1
+-wsk action update GoLL LL1000128M.go --annotation concurrency 1
++wsk action update GoLL LL1000128M.go --annotation concurrency 1 --timeout 120000
+ # wsk action update GoLL LL1000128M.go --memory 128
+ wsk api create /GoLL get GoLL --response-type json
+ 
+diff --git a/core/invoker/src/main/resources/application.conf b/core/invoker/src/main/resources/application.conf
+index ba7f50bf..7c7ad719 100644
+--- a/core/invoker/src/main/resources/application.conf
++++ b/core/invoker/src/main/resources/application.conf
+@@ -63,6 +63,7 @@ whisk {
+     user-memory: 1024 m
+     concurrent-peek-factor: 0.5 #factor used to limit message peeking: 0 < factor <= 1.0 - larger number improves concurrent processing, but increases risk of message loss during invoker crash
+     akka-client:  false # if true, use PoolingContainerClient for HTTP from invoker to action container (otherwise use ApacheBlockingContainerClient)
++    prewarm-configs = []
+     prewarm-expiration-check-init-delay: 10 minute # the init delay time for the first check
+     prewarm-expiration-check-interval: 10 minute # period to check for prewarm expiration
+     prewarm-expiration-check-interval-variance: 10 seconds # varies expiration across invokers to avoid many concurrent expirations
+@@ -160,11 +161,9 @@ whisk {
+ 
+   container-proxy {
+     timeouts {
+-      # The "unusedTimeout" in the ContainerProxy,
+-      #aka 'How long should a container sit idle until we kill it?'
+-      idle-container = 10 minutes
+-      pause-grace = 10 seconds
+-      keeping-duration = 10 minutes
++      idle-container = 365 days
++      pause-grace = 365 days
++      keeping-duration = 365 days
+     }
+     action-health-check {
+       enabled = false # if true, prewarm containers will be pinged periodically and warm containers will be pinged once after resumed
+@@ -195,6 +194,9 @@ whisk {
+     dedicated {
+       namespaces: ""
+     }
++    container {
++      creationMaxPeek = 1
++    }
+   }
+   runtime.delete.timeout = "30 seconds"
+ }
+diff --git a/core/invoker/src/main/scala/org/apache/openwhisk/core/containerpool/ContainerPool.scala b/core/invoker/src/main/scala/org/apache/openwhisk/core/containerpool/ContainerPool.scala
+index 3c2ebd9c..e4fe29a6 100644
+--- a/core/invoker/src/main/scala/org/apache/openwhisk/core/containerpool/ContainerPool.scala
++++ b/core/invoker/src/main/scala/org/apache/openwhisk/core/containerpool/ContainerPool.scala
+@@ -28,6 +28,7 @@ import scala.annotation.tailrec
+ import scala.collection.immutable
+ import scala.concurrent.duration._
+ import scala.util.{Random, Try}
++import java.time.Instant
+ 
+ case class ColdStartKey(kind: String, memory: ByteSize)
+ 
+@@ -81,6 +82,9 @@ class ContainerPool(childFactory: ActorRefFactory => ActorRef,
+   // Key is ColdStartKey, value is the number of cold Start in minute
+   var coldStartCount = immutable.Map.empty[ColdStartKey, Int]
+ 
++  // Map to store the container assigned to each action
++  var actionContainers = immutable.Map.empty[FullyQualifiedEntityName, (ActorRef, ContainerData)]
++
+   adjustPrewarmedContainer(true, false)
+ 
+   // check periodically, adjust prewarmed container(delete if unused for some time and create some increment containers)
+@@ -120,150 +124,43 @@ class ContainerPool(childFactory: ActorRefFactory => ActorRef,
+     // their requests and send them back to the pool for rescheduling (this may happen if "docker" operations
+     // fail for example, or a container has aged and was destroying itself when a new request was assigned)
+     case r: Run =>
+-      // Check if the message is resent from the buffer. Only the first message on the buffer can be resent.
+-      val isResentFromBuffer = runBuffer.nonEmpty && runBuffer.dequeueOption.exists(_._1.msg == r.msg)
+-
+-      // Only process request, if there are no other requests waiting for free slots, or if the current request is the
+-      // next request to process
+-      // It is guaranteed, that only the first message on the buffer is resent.
+-      if (runBuffer.isEmpty || isResentFromBuffer) {
+-        if (isResentFromBuffer) {
+-          //remove from resent tracking - it may get resent again, or get processed
+-          resent = None
++        val actionName = r.action.fullyQualifiedName(false)
++
++        // Check if a container already exists for this action
++        actionContainers.get(actionName) match {
++          case Some((actorRef, containerData)) =>
++            // Container exists, update its state and send activation
++            val newData = containerData.nextRun(r)
++            actionContainers = actionContainers + (actionName -> (actorRef, newData))
++            actorRef ! r
++            logContainerStart(r, "existing", newData.activeActivationCount, newData.getContainer)
++          case None =>
++            // No container exists, create a new one
++            val memory = r.action.limits.memory.megabytes.MB
++            val (actorRef, containerData) = createContainer(memory)
++            val newData = containerData.nextRun(r)
++            actionContainers = actionContainers + (actionName -> (actorRef, newData))
++            actorRef ! r
++            logContainerStart(r, "cold", newData.activeActivationCount, newData.getContainer)
+         }
+-        val kind = r.action.exec.kind
+-        val memory = r.action.limits.memory.megabytes.MB
+-
+-        val createdContainer =
+-          // Schedule a job to a warm container
+-          ContainerPool
+-            .schedule(r.action, r.msg.user.namespace.name, freePool)
+-            .map(container => (container, container._2.initingState)) //warmed, warming, and warmingCold always know their state
+-            .orElse(
+-              // There was no warm/warming/warmingCold container. Try to take a prewarm container or a cold container.
+-              // When take prewarm container, has no need to judge whether user memory is enough
+-              takePrewarmContainer(r.action)
+-                .map(container => (container, "prewarmed"))
+-                .orElse {
+-                  // Is there enough space to create a new container or do other containers have to be removed?
+-                  if (hasPoolSpaceFor(busyPool ++ freePool ++ prewarmedPool, prewarmStartingPool, memory)) {
+-                    val container = Some(createContainer(memory), "cold")
+-                    incrementColdStartCount(kind, memory)
+-                    container
+-                  } else None
+-                })
+-            .orElse(
+-              // Remove a container and create a new one for the given job
+-              ContainerPool
+-              // Only free up the amount, that is really needed to free up
+-                .remove(freePool, Math.min(r.action.limits.memory.megabytes, memoryConsumptionOf(freePool)).MB)
+-                .map(removeContainer)
+-                // If the list had at least one entry, enough containers were removed to start the new container. After
+-                // removing the containers, we are not interested anymore in the containers that have been removed.
+-                .headOption
+-                .map(_ =>
+-                  takePrewarmContainer(r.action)
+-                    .map(container => (container, "recreatedPrewarm"))
+-                    .getOrElse {
+-                      val container = (createContainer(memory), "recreated")
+-                      incrementColdStartCount(kind, memory)
+-                      container
+-                  }))
+-
+-        createdContainer match {
+-          case Some(((actor, data), containerState)) =>
+-            //increment active count before storing in pool map
+-            val newData = data.nextRun(r)
+-            val container = newData.getContainer
+-
+-            if (newData.activeActivationCount < 1) {
+-              logging.error(this, s"invalid activation count < 1 ${newData}")
+-            }
+ 
+-            //only move to busyPool if max reached
+-            if (!newData.hasCapacity()) {
+-              if (r.action.limits.concurrency.maxConcurrent > 1) {
+-                logging.info(
+-                  this,
+-                  s"container ${container} is now busy with ${newData.activeActivationCount} activations")
+-              }
+-              busyPool = busyPool + (actor -> newData)
+-              freePool = freePool - actor
+-            } else {
+-              //update freePool to track counts
+-              freePool = freePool + (actor -> newData)
+-            }
+-            // Remove the action that was just executed from the buffer and execute the next one in the queue.
+-            if (isResentFromBuffer) {
+-              // It is guaranteed that the currently executed messages is the head of the queue, if the message comes
+-              // from the buffer
+-              val (_, newBuffer) = runBuffer.dequeue
+-              runBuffer = newBuffer
+-              // Try to process the next item in buffer (or get another message from feed, if buffer is now empty)
+-              processBufferOrFeed()
+-            }
+-            actor ! r // forwards the run request to the container
+-            logContainerStart(r, containerState, newData.activeActivationCount, container)
+-          case None =>
+-            // this can also happen if createContainer fails to start a new container, or
+-            // if a job is rescheduled but the container it was allocated to has not yet destroyed itself
+-            // (and a new container would over commit the pool)
+-            val isErrorLogged = r.retryLogDeadline.map(_.isOverdue).getOrElse(true)
+-            val retryLogDeadline = if (isErrorLogged) {
+-              logging.warn(
+-                this,
+-                s"Rescheduling Run message, too many message in the pool, " +
+-                  s"freePoolSize: ${freePool.size} containers and ${memoryConsumptionOf(freePool)} MB, " +
+-                  s"busyPoolSize: ${busyPool.size} containers and ${memoryConsumptionOf(busyPool)} MB, " +
+-                  s"maxContainersMemory ${poolConfig.userMemory.toMB} MB, " +
+-                  s"userNamespace: ${r.msg.user.namespace.name}, action: ${r.action}, " +
+-                  s"needed memory: ${r.action.limits.memory.megabytes} MB, " +
+-                  s"waiting messages: ${runBuffer.size}")(r.msg.transid)
+-              MetricEmitter.emitCounterMetric(LoggingMarkers.CONTAINER_POOL_RESCHEDULED_ACTIVATION)
+-              Some(logMessageInterval.fromNow)
+-            } else {
+-              r.retryLogDeadline
+-            }
+-            if (!isResentFromBuffer) {
+-              // Add this request to the buffer, as it is not there yet.
+-              runBuffer = runBuffer.enqueue(Run(r.action, r.msg, retryLogDeadline))
++        // Process the next item in the buffer or feed
++        processBufferOrFeed()
++
++      // Container is free to take more work
++          case NeedWork(containerData) =>
++            containerData match {
++              case data: WarmedData =>
++                handleNeedWork(data)
++              case data: WarmingData =>
++                handleNeedWork(data)
++              case data: WarmingColdData =>
++                handleNeedWork(data)
++              case _ =>
++                logging.warn(this, s"Received NeedWork with unexpected containerData type: ${containerData.getClass}")
+             }
+-          //buffered items will be processed via processBufferOrFeed()
+-        }
+-      } else {
+-        // There are currently actions waiting to be executed before this action gets executed.
+-        // These waiting actions were not able to free up enough memory.
+-        runBuffer = runBuffer.enqueue(r)
+-      }
++        processBufferOrFeed()
+ 
+-    // Container is free to take more work
+-    case NeedWork(warmData: WarmedData) =>
+-      val oldData = freePool.get(sender()).getOrElse(busyPool(sender()))
+-      val newData =
+-        warmData.copy(lastUsed = oldData.lastUsed, activeActivationCount = oldData.activeActivationCount - 1)
+-      if (newData.activeActivationCount < 0) {
+-        logging.error(this, s"invalid activation count after warming < 1 ${newData}")
+-      }
+-      if (newData.hasCapacity()) {
+-        //remove from busy pool (may already not be there), put back into free pool (to update activation counts)
+-        freePool = freePool + (sender() -> newData)
+-        if (busyPool.contains(sender())) {
+-          busyPool = busyPool - sender()
+-          if (newData.action.limits.concurrency.maxConcurrent > 1) {
+-            logging.info(
+-              this,
+-              s"concurrent container ${newData.container} is no longer busy with ${newData.activeActivationCount} activations")
+-          }
+-        }
+-      } else {
+-        busyPool = busyPool + (sender() -> newData)
+-        freePool = freePool - sender()
+-      }
+-      processBufferOrFeed()
+-    // Container is prewarmed and ready to take work
+-    case NeedWork(data: PreWarmedData) =>
+-      prewarmStartingPool = prewarmStartingPool - sender()
+-      prewarmedPool = prewarmedPool + (sender() -> data)
+ 
+     // Container got removed
+     case ContainerRemoved(replacePrewarm) =>
+@@ -310,6 +207,45 @@ class ContainerPool(childFactory: ActorRefFactory => ActorRef,
+       adjustPrewarmedContainer(false, true)
+   }
+ 
++// Helper method to handle containerData types with 'action'
++def handleNeedWork(data: ContainerData): Unit = {
++  val actionNameOpt = data match {
++    case d: WarmedData        => Some(d.action.fullyQualifiedName(false))
++    case d: WarmingData       => Some(d.action.fullyQualifiedName(false))
++    case d: WarmingColdData   => Some(d.action.fullyQualifiedName(false))
++    case _ =>
++      logging.warn(this, s"Unexpected containerData type in handleNeedWork: ${data.getClass}")
++      None
++  }
++
++  actionNameOpt.foreach { actionName =>
++    actionContainers.get(actionName).foreach {
++      case (actorRef, existingData) if actorRef == sender() =>
++        val newData = existingData match {
++          case warmData: WarmedData =>
++            warmData.copy(
++              lastUsed = Instant.now,
++              activeActivationCount = warmData.activeActivationCount - 1
++            )
++          case warmingData: WarmingData =>
++            warmingData.copy(
++              activeActivationCount = warmingData.activeActivationCount - 1
++            )
++          case warmingColdData: WarmingColdData =>
++            warmingColdData.copy(
++              activeActivationCount = warmingColdData.activeActivationCount - 1
++            )
++          case _ =>
++            logging.warn(this, s"Received NeedWork with unexpected existingData type: ${existingData.getClass}")
++            existingData
++        }
++        actionContainers = actionContainers + (actionName -> (actorRef, newData))
++      case _ =>
++        logging.warn(this, s"Received NeedWork with mismatched containerData in actionContainers")
++    }
++  }
++}
++
+   /** Resend next item in the buffer, or trigger next item in the feed, if no items in the buffer. */
+   def processBufferOrFeed() = {
+     // If buffer has more items, and head has not already been resent, send next one, otherwise get next from feed.
+diff --git a/core/invoker/src/main/scala/org/apache/openwhisk/core/containerpool/ContainerProxy.scala b/core/invoker/src/main/scala/org/apache/openwhisk/core/containerpool/ContainerProxy.scala
+index 8261d49d..60c8ec31 100644
+--- a/core/invoker/src/main/scala/org/apache/openwhisk/core/containerpool/ContainerProxy.scala
++++ b/core/invoker/src/main/scala/org/apache/openwhisk/core/containerpool/ContainerProxy.scala
+@@ -505,28 +505,24 @@ class ContainerProxy(factory: (TransactionId,
+     case _ => delay
+   }
+ 
+-  when(Ready, stateTimeout = pauseGrace) {
+-    case Event(job: Run, data: WarmedData) =>
+-      implicit val transid = job.msg.transid
+-      activeCount += 1
+-      val newData = data.withResumeRun(job)
+-      initializeAndRun(data.container, job, true)
+-        .map(_ => RunCompleted)
+-        .pipeTo(self)
+-
+-      goto(Running) using newData
++when(Ready) {
++  case Event(StateTimeout, data: WarmedData) =>
++    // Do not transition to Pausing state due to idle timeout
++    stay
+ 
+-    // pause grace timed out
+-    case Event(StateTimeout, data: WarmedData) =>
+-      data.container.suspend()(TransactionId.invokerNanny).map(_ => ContainerPaused).pipeTo(self)
+-      goto(Pausing)
++  case Event(Remove, _) =>
++    // Ignore remove messages
++    stay
+ 
+-    case Event(Remove, data: WarmedData) => destroyContainer(data, true)
++  case Event(r: Run, data: WarmedData) =>
++    implicit val transid = r.msg.transid
++    activeCount += 1
++    initializeAndRun(data.container, r)
++      .map(_ => RunCompleted)
++      .pipeTo(self)
++    goto(Running) using data
++}
+ 
+-    // warm container failed
+-    case Event(_: FailureMessage, data: WarmedData) =>
+-      destroyContainer(data, true)
+-  }
+ 
+   when(Pausing) {
+     case Event(ContainerPaused, data: WarmedData)   => goto(Paused)
+diff --git a/core/standalone/src/main/resources/standalone.conf b/core/standalone/src/main/resources/standalone.conf
+index 87361538..c78aa25c 100644
+--- a/core/standalone/src/main/resources/standalone.conf
++++ b/core/standalone/src/main/resources/standalone.conf
+@@ -1,19 +1,4 @@
+-#
+-# Licensed to the Apache Software Foundation (ASF) under one or more
+-# contributor license agreements.  See the NOTICE file distributed with
+-# this work for additional information regarding copyright ownership.
+-# The ASF licenses this file to You under the Apache License, Version 2.0
+-# (the "License"); you may not use this file except in compliance with
+-# the License.  You may obtain a copy of the License at
+-#
+-#     http://www.apache.org/licenses/LICENSE-2.0
+-#
+-# Unless required by applicable law or agreed to in writing, software
+-# distributed under the License is distributed on an "AS IS" BASIS,
+-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+-# See the License for the specific language governing permissions and
+-# limitations under the License.
+-#
++# standalone.conf
+ 
+ include classpath("application.conf")
+ 
+@@ -74,10 +59,11 @@ whisk {
+   }
+ 
+   docker {
+-    # Path to docker executuable. Generally its /var/lib/docker
++    # Path to docker executable. Generally it's /var/lib/docker
+     # executable =
++
+     standalone.container-factory {
+-      #If enabled then pull would also be attempted for standard OpenWhisk images under`openwhisk` prefix
++      # If enabled then pull would also be attempted for standard OpenWhisk images under `openwhisk` prefix
+       pull-standard-images = true
+     }
+ 
+@@ -86,6 +72,7 @@ whisk {
+       use-runc = false
+     }
+   }
++
+   swagger-ui {
+     file-system = false
+     dir-path = "BOOT-INF/classes/swagger-ui"
+@@ -130,16 +117,30 @@ whisk {
+       grafana-image = "grafana/grafana:6.1.6"
+     }
+   }
++
+   apache-client {
+     retry-no-http-response-exception = true
+   }
++
++  # Add the following configurations to disable prewarming and adjust timeouts
+   container-factory {
++    # Disable prewarmed containers by setting an empty list
++    prewarm-configurations = []
++
+     container-args {
+       extra-args {
+         env += ${?CONTAINER_EXTRA_ENV}
+       }
+     }
+   }
++
++  # Set high timeouts to prevent container pausing or removal
++  containerProxy {
++    timeouts {
++      idle-container = 365 days   # Prevents the container from being destroyed due to idleness
++      pause-grace = 365 days      # Prevents the container from being paused
++    }
++  }
+ }
+ 
+ akka-http-cors {
