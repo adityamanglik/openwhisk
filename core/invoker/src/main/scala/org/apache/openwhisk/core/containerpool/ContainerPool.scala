@@ -19,6 +19,8 @@ import scala.concurrent.duration._
 import scala.util.{Random, Try}
 import java.time.Instant
 
+import org.apache.openwhisk.core.entity.ExecutableWhiskAction
+
 case class ColdStartKey(kind: String, memory: ByteSize)
 
 case object EmitMetrics
@@ -53,7 +55,8 @@ class ContainerPool(childFactory: ActorRefFactory => ActorRef,
   import ContainerPool.memoryConsumptionOf
 
   // Scheduling Policy
-  val schedulingPolicy: String = "RoundRobin" // Change to "RoundRobin" to switch policies
+  val schedulingPolicy: String = "GCMitigation" // Changed to "GCMitigation"
+  var initialRunMessage: Option[Run] = None
   val numContainers: Int = 2 // Number of containers for RoundRobin policy
 
   implicit val ec = context.dispatcher
@@ -115,6 +118,9 @@ class ContainerPool(childFactory: ActorRefFactory => ActorRef,
       akka.event.Logging.InfoLevel)
   }
 
+  // Added for GCMitigation policy
+  val requestHeapMargin: Long = 5 * 1024 * 1024L // Configurable margin
+
   def receive: Receive = {
     // A job to run on a container
     //
@@ -122,9 +128,93 @@ class ContainerPool(childFactory: ActorRefFactory => ActorRef,
     // their requests and send them back to the pool for rescheduling (this may happen if "docker" operations
     // fail for example, or a container has aged and was destroying itself when a new request was assigned)
     case r: Run =>
+      // Capture the initial Run message
+      if (initialRunMessage.isEmpty) {
+        initialRunMessage = Some(r)
+        logging.info(this, s"Captured initial Run message for action: ${r.action.fullyQualifiedName(false)}")
+      }
       val actionName = r.action.fullyQualifiedName(false)
-
       schedulingPolicy match {
+        case "GCMitigation" =>
+          actionContainers.get(actionName) match {
+            case Some(RoundRobinContainerData(containers, nextIndex)) =>
+              // Find a container that is not about to undergo GC
+              val suitableContainerOption = containers.find { case (_, data) =>
+                data match {
+                  case warmedData: WarmedData =>
+                    warmedData.gcMetric match {
+                      case Some(gcMetric) =>
+                        val heapAlloc = gcMetric.heapAlloc
+                        val nextGC = gcMetric.nextGC
+                        val margin = requestHeapMargin
+                        (heapAlloc + margin) <= nextGC
+                      case None =>
+                        true //  or false, depending on your policy
+                    }
+                  case _ =>
+                    true // If not WarmedData, consider it suitable
+                }
+              }
+
+              suitableContainerOption match {
+                case Some((actorRef, containerData)) =>
+                  // Found a suitable container
+                  val newData = containerData.nextRun(r)
+                  val index = containers.indexWhere { case (ref, _) => ref == actorRef }
+                  if (index >= 0) {
+                    val updatedContainers = containers.updated(index, (actorRef, newData))
+                    val updatedNextIndex = (nextIndex + 1) % containers.size
+                    actionContainers = actionContainers.updated(actionName, RoundRobinContainerData(updatedContainers, updatedNextIndex))
+                    actorRef ! r
+                    logContainerStart(r, "existing", newData.activeActivationCount, newData.getContainer)
+                    // Move container from freePool to busyPool
+                    freePool = freePool - actorRef
+                    busyPool = busyPool + (actorRef -> newData)
+                    resent = None
+                  } else {
+                    logging.warn(this, s"Could not find container $actorRef in containers list")
+                  }
+                case None =>
+                  // All containers are close to GC, send fake activation to trigger GC
+                  val activationRequest = createModifiedRun(r)
+                  containers.foreach { case (actorRef, containerData) =>
+                    actorRef ! activationRequest
+                  }
+                  // Buffer the request
+                  runBuffer = runBuffer.enqueue(r)
+                  logging.info(this, s"All containers are undergoing GC; buffering request.")
+              }
+            
+            case Some(SingleContainerData((actorRef, containerData))) =>
+              // Handle unexpected SingleContainerData in GCMitigation policy
+              logging.warn(this, s"Expected RoundRobinContainerData but found SingleContainerData for action $actionName")
+              // Convert SingleContainerData to RoundRobinContainerData with a single container
+              val containers = List((actorRef, containerData))
+              val updatedContainers = containers
+              val updatedNextIndex = 0
+              actionContainers = actionContainers.updated(
+                actionName,
+                RoundRobinContainerData(updatedContainers, updatedNextIndex))
+              self ! r // Retry processing the Run message
+
+            case None =>
+              // Create initial containers
+              val memory = r.action.limits.memory.megabytes.MB
+              val newContainers = (1 to numContainers).map { _ =>
+                createContainer(memory)
+              }.toList
+              val updatedContainers = newContainers.map { case (actorRef, containerData) => (actorRef, containerData) }
+              val (actorRef, containerData) = updatedContainers(0)
+              val newData = containerData.nextRun(r)
+              val updatedContainersWithNewData = updatedContainers.updated(0, (actorRef, newData))
+              actionContainers = actionContainers + (actionName -> RoundRobinContainerData(updatedContainersWithNewData, 1))
+              actorRef ! r
+              logContainerStart(r, "cold", newData.activeActivationCount, newData.getContainer)
+              // Add this code to move container from freePool to busyPool
+              freePool = freePool - actorRef
+              busyPool = busyPool + (actorRef -> newData)
+          }
+
         case "SingleContainer" =>
           actionContainers.get(actionName) match {
             case Some(SingleContainerData((actorRef, containerData))) =>
@@ -132,6 +222,7 @@ class ContainerPool(childFactory: ActorRefFactory => ActorRef,
               actionContainers = actionContainers + (actionName -> SingleContainerData((actorRef, newData)))
               actorRef ! r
               logContainerStart(r, "existing", newData.activeActivationCount, newData.getContainer)
+              resent = None
             case Some(otherData) =>
               logging.warn(this, s"Expected SingleContainerData but found $otherData")
             case None =>
@@ -156,6 +247,7 @@ class ContainerPool(childFactory: ActorRefFactory => ActorRef,
                 actionContainers.updated(actionName, RoundRobinContainerData(updatedContainers, updatedNextIndex))
               actorRef ! r
               logContainerStart(r, "existing", newData.activeActivationCount, newData.getContainer)
+              resent = None
             case Some(otherData) =>
               logging.warn(this, s"Expected RoundRobinContainerData but found $otherData")
             case None =>
@@ -240,6 +332,17 @@ class ContainerPool(childFactory: ActorRefFactory => ActorRef,
 
     case AdjustPrewarmedContainer =>
       adjustPrewarmedContainer(false, true)
+
+    case UpdateContainerData(newData) =>
+      val actorRef = sender()
+      if (freePool.contains(actorRef)) {
+        freePool = freePool + (actorRef -> newData)
+      } else if (busyPool.contains(actorRef)) {
+        busyPool = busyPool + (actorRef -> newData)
+      } else {
+        // Handle the case where the actorRef is not found
+        logging.warn(this, s"Received UpdateContainerData from unknown actor $actorRef")
+      }
   }
 
   // Helper method to handle containerData types with 'action'
@@ -258,15 +361,17 @@ class ContainerPool(childFactory: ActorRefFactory => ActorRef,
         case Some(SingleContainerData((actorRef, existingData))) if actorRef == sender() =>
           val newData = existingData match {
             case warmData: WarmedData =>
-              warmData.copy(
+              // Update the GC metrics from the received containerData
+                warmData.copy(
                 lastUsed = Instant.now,
-                activeActivationCount = warmData.activeActivationCount - 1
+                activeActivationCount = warmData.activeActivationCount - 1,
+                gcMetric = data.gcMetric
               )
             case warmingData: WarmingData =>
               warmingData.copy(
-                lastUsed = Instant.now,
-                activeActivationCount = warmingData.activeActivationCount - 1
-              )
+              lastUsed = Instant.now,
+              activeActivationCount = warmingData.activeActivationCount - 1
+            )
             case warmingColdData: WarmingColdData =>
               warmingColdData.copy(
                 activeActivationCount = warmingColdData.activeActivationCount - 1
@@ -276,6 +381,13 @@ class ContainerPool(childFactory: ActorRefFactory => ActorRef,
               existingData
           }
           actionContainers = actionContainers + (actionName -> SingleContainerData((actorRef, newData)))
+          // Move container from busyPool to freePool
+          busyPool = busyPool - actorRef
+          freePool = freePool + (actorRef -> newData)
+
+        case Some(SingleContainerData((actorRef, existingData))) =>
+          // Handle the case when actorRef != sender()
+          logging.warn(this, s"Received NeedWork from unexpected actorRef in SingleContainerData")
 
         case Some(RoundRobinContainerData(containers, nextIndex)) =>
           val index = containers.indexWhere { case (actorRef, _) => actorRef == sender() }
@@ -283,9 +395,11 @@ class ContainerPool(childFactory: ActorRefFactory => ActorRef,
             val (actorRef, existingData) = containers(index)
             val newData = existingData match {
               case warmData: WarmedData =>
-                warmData.copy(
+                // Update the GC metrics from the received containerData
+                  warmData.copy(
                   lastUsed = Instant.now,
-                  activeActivationCount = warmData.activeActivationCount - 1
+                  activeActivationCount = warmData.activeActivationCount - 1,
+                  gcMetric = data.gcMetric
                 )
               case warmingData: WarmingData =>
                 warmingData.copy(
@@ -302,6 +416,9 @@ class ContainerPool(childFactory: ActorRefFactory => ActorRef,
             }
             val updatedContainers = containers.updated(index, (actorRef, newData))
             actionContainers = actionContainers + (actionName -> RoundRobinContainerData(updatedContainers, nextIndex))
+            // Move container from busyPool to freePool
+            busyPool = busyPool - actorRef
+            freePool = freePool + (actorRef -> newData)
           } else {
             logging.warn(this, s"Received NeedWork with mismatched containerData in actionContainers")
           }
@@ -324,12 +441,30 @@ class ContainerPool(childFactory: ActorRefFactory => ActorRef,
         if (resent.isEmpty) {
           logging.info(this, s"re-processing from buffer (${runBuffer.length} items in buffer)")
           resent = Some(run)
+          runBuffer = q // Update the buffer to the remaining items
           self ! run
         } else {
           // Do not resend the buffer head multiple times (may reach this point from multiple messages, before the buffer head is re-processed)
         }
       case None => // Feed me!
         feed ! MessageFeed.Processed
+    }
+  }
+
+  // Method to create a modified Run message using the stored initial Run message
+  def createModifiedRun(originalRun: Run): Run = {
+    initialRunMessage.map { storedRun =>
+      val newActivationId = ActivationId.generate()
+      val modifiedMessage = storedRun.msg.copy(
+        activationId = newActivationId,
+        transid = TransactionId.invokerNanny
+        // You can modify other fields if necessary
+      )
+      Run(storedRun.action, modifiedMessage)
+    }.getOrElse {
+      // If we haven't captured an initial Run message, fall back to originalRun
+      logging.warn(this, "No initial Run message captured; using original Run message.")
+      originalRun
     }
   }
 
@@ -515,7 +650,7 @@ object ContainerPool {
                                            idles: Map[A, ContainerData]): Option[(A, ContainerData)] = {
     idles
       .find {
-        case (_, c @ WarmedData(_, `invocationNamespace`, `action`, _, _, _)) if c.hasCapacity() => true
+        case (_, c @ WarmedData(_, `invocationNamespace`, `action`, _, _, _, _)) if c.hasCapacity() => true
         case _                                                                                   => false
       }
       .orElse {

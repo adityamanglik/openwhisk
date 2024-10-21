@@ -75,11 +75,16 @@ case object Pausing extends ContainerState
 case object Paused extends ContainerState
 case object Removing extends ContainerState
 
-// Data
-/** Base data type */
-sealed abstract class ContainerData(val lastUsed: Instant, val memoryLimit: ByteSize, val activeActivationCount: Int) {
+// Added for GC metrics
+case class UpdateContainerData(newData: ContainerData)
+// Define the GCMetric case class
+case class GCMetric(heapAlloc: Long, nextGC: Long, numGC: Long)
 
-  /** When ContainerProxy in this state is scheduled, it may result in a new state (ContainerData)*/
+// Updated ContainerData and its subclasses to include GC metrics
+sealed abstract class ContainerData(val lastUsed: Instant,
+                                    val memoryLimit: ByteSize,
+                                    val activeActivationCount: Int,
+                                    val gcMetric: Option[GCMetric] = None) {
   def nextRun(r: Run): ContainerData
 
   /**
@@ -108,8 +113,9 @@ sealed abstract class ContainerNotStarted(override val lastUsed: Instant,
 sealed abstract class ContainerStarted(val container: Container,
                                        override val lastUsed: Instant,
                                        override val memoryLimit: ByteSize,
-                                       override val activeActivationCount: Int)
-    extends ContainerData(lastUsed, memoryLimit, activeActivationCount) {
+                                       override val activeActivationCount: Int,
+                                       override val gcMetric: Option[GCMetric] = None)
+    extends ContainerData(lastUsed, memoryLimit, activeActivationCount, gcMetric) {
   override def getContainer = Some(container)
 }
 
@@ -183,8 +189,9 @@ case class WarmedData(override val container: Container,
                       action: ExecutableWhiskAction,
                       override val lastUsed: Instant,
                       override val activeActivationCount: Int = 0,
-                      resumeRun: Option[Run] = None)
-    extends ContainerStarted(container, lastUsed, action.limits.memory.megabytes.MB, activeActivationCount)
+                      resumeRun: Option[Run] = None,
+                      override val gcMetric: Option[GCMetric] = None)
+    extends ContainerStarted(container, lastUsed, action.limits.memory.megabytes.MB, activeActivationCount, gcMetric)
     with ContainerInUse {
   override val initingState = "warmed"
   override def nextRun(r: Run) = copy(lastUsed = Instant.now, activeActivationCount = activeActivationCount + 1)
@@ -886,7 +893,7 @@ when(Ready) {
         }
     }
 
-    val context = UserContext(job.msg.user)
+    val userContext = UserContext(job.msg.user)
 
     // Adds logs to the raw activation.
     val activationWithLogs: Future[Either[ActivationLogReadingError, WhiskActivation]] = activation
@@ -927,25 +934,52 @@ when(Ready) {
                 job.msg.user.namespace.uuid,
                 CompletionMessage(tid, activation, instance)))
         }
-        storeActivation(tid, activation, job.msg.blocking, context)
+        storeActivation(tid, activation, job.msg.blocking, userContext)
       }
 
     // Disambiguate activation errors and transform the Either into a failed/successful Future respectively.
-    activationWithLogs.flatMap {
-      case Right(act) if act.response.isSuccess || act.response.isApplicationError =>
-        if (act.response.isApplicationError && activationErrorLoggingConfig.applicationErrors) {
-          logTruncatedError(act)
-        }
-        Future.successful(act)
-      case Right(act) =>
-        if ((act.response.isContainerError && activationErrorLoggingConfig.developerErrors) ||
-            (act.response.isWhiskError && activationErrorLoggingConfig.whiskErrors)) {
-          logTruncatedError(act)
-        }
-        Future.failed(ActivationUnsuccessfulError(act))
-      case Left(error) => Future.failed(error)
-    }
+      activationWithLogs.flatMap {
+        case Right(act) =>
+          // Extract GC metrics from the activation
+          val gcMetric = extractGCMetricFromActivation(act)
+
+          // Send updated ContainerData to ContainerPool
+          val updatedData = stateData match {
+            case data: WarmedData =>
+              data.copy(gcMetric = Some(gcMetric))
+            case data =>
+              data // For other cases, you might need to handle appropriately
+          }
+
+          // Send UpdateContainerData message to ContainerPool
+          this.context.parent ! UpdateContainerData(updatedData)
+
+          if (act.response.isSuccess || act.response.isApplicationError) {
+            if (act.response.isApplicationError && activationErrorLoggingConfig.applicationErrors) {
+              logTruncatedError(act)
+            }
+            Future.successful(act)
+          } else {
+            if ((act.response.isContainerError && activationErrorLoggingConfig.developerErrors) ||
+                (act.response.isWhiskError && activationErrorLoggingConfig.whiskErrors)) {
+              logTruncatedError(act)
+            }
+            Future.failed(ActivationUnsuccessfulError(act))
+          }
+        case Left(error) => Future.failed(error)
+      }
   }
+
+  def extractGCMetricFromActivation(activation: WhiskActivation): GCMetric = {
+    // Assuming the GC metrics are returned in the activation's annotations or result
+    val annotations = activation.annotations
+    val heapAlloc = annotations.get("heapAlloc").map(_.convertTo[Long]).getOrElse(0L)
+    val nextGC = annotations.get("nextGC").map(_.convertTo[Long]).getOrElse(Long.MaxValue)
+    val numGC = annotations.get("numGC").map(_.convertTo[Long]).getOrElse(0L)
+
+    GCMetric(heapAlloc, nextGC, numGC)
+  }
+
   //to ensure we don't blow up logs with potentially large activation response error
   private def logTruncatedError(act: WhiskActivation) = {
     val truncate = 1024
@@ -1138,43 +1172,42 @@ class TCPPingClient(tcp: ActorRef,
   private def cancelPing() = {
     scheduledPing.foreach(_.cancel())
   }
-  def receive = {
-    case HealthPingEnabled(enabled) =>
-      if (enabled) {
-        restartPing()
-      } else {
-        cancelPing()
-      }
-    case HealthPingSend =>
-      healthPingTx = TransactionId(systemPrefix + "actionHealth") //reset the tx id each iteration
-      tcp ! Connect(remote)
-    case CommandFailed(_: Connect) =>
-      failedCount += 1
-      if (failedCount == config.maxFails) {
-        logging.error(
-          this,
-          s"Failed health connection to $containerId ($addressString) $failedCount times - exceeded max ${config.maxFails} failures")
-        //destroy this container since we cannot communicate with it
-        context.parent ! FailureMessage(
-          new SocketException(s"Health connection to $containerId ($addressString) failed $failedCount times"))
-        cancelPing()
-        context.stop(self)
-      } else {
-        logging.warn(this, s"Failed health connection to $containerId ($addressString) $failedCount times")
-      }
+def receive = {
+  case HealthPingEnabled(enabled) =>
+    if (enabled) {
+      restartPing()
+    } else {
+      cancelPing()
+    }
+  case HealthPingSend =>
+    healthPingTx = TransactionId(systemPrefix + "actionHealth") //reset the tx id each iteration
+    tcp ! Connect(remote)
+  case CommandFailed(_: Connect) =>
+    failedCount += 1
+    if (failedCount == config.maxFails) {
+      logging.error(
+        this,
+        s"Failed health connection to $containerId ($addressString) $failedCount times - exceeded max ${config.maxFails} failures")
+      //destroy this container since we cannot communicate with it
+      context.parent ! FailureMessage(
+        new SocketException(s"Health connection to $containerId ($addressString) failed $failedCount times"))
+      cancelPing()
+      context.stop(self)
+    } else {
+      logging.warn(this, s"Failed health connection to $containerId ($addressString) $failedCount times")
+    }
 
-    case Connected(_, _) =>
-      sender() ! Close
-      if (failedCount > 0) {
-        //reset in case of temp failure
-        logging.info(
-          this,
-          s"Succeeded health connection to $containerId ($addressString) after $failedCount previous failures")
-        failedCount = 0
-      } else {
-        logging.debug(this, s"Succeeded health connection to $containerId ($addressString)")
-      }
-
+  case Connected(_, _) =>
+    sender() ! Close
+    if (failedCount > 0) {
+      //reset in case of temp failure
+      logging.info(
+        this,
+        s"Succeeded health connection to $containerId ($addressString) after $failedCount previous failures")
+      failedCount = 0
+    } else {
+      logging.debug(this, s"Succeeded health connection to $containerId ($addressString)")
+    }
   }
 }
 
