@@ -136,6 +136,9 @@ class ContainerPool(childFactory: ActorRefFactory => ActorRef,
       val actionName = r.action.fullyQualifiedName(false)
       schedulingPolicy match {
         case "GCMitigation" =>
+          logging.info(this, s"******************************************************************************")
+          logging.info(this, s"Publishing message: $msg ")
+          logging.info(this, s"******************************************************************************")
           actionContainers.get(actionName) match {
             case Some(RoundRobinContainerData(containers, nextIndex)) =>
               // Find a container that is not about to undergo GC
@@ -172,7 +175,9 @@ class ContainerPool(childFactory: ActorRefFactory => ActorRef,
                     busyPool = busyPool + (actorRef -> newData)
                     resent = None
                   } else {
-                    logging.warn(this, s"Could not find container $actorRef in containers list")
+                    // this should never happen, fail fast
+                    logging.error(this, s"Could not find container $actorRef in containers list")
+                    context.stop(self)
                   }
                 case None =>
                   // All containers are close to GC, send fake activation to trigger GC
@@ -187,7 +192,9 @@ class ContainerPool(childFactory: ActorRefFactory => ActorRef,
             
             case Some(SingleContainerData((actorRef, containerData))) =>
               // Handle unexpected SingleContainerData in GCMitigation policy
-              logging.warn(this, s"Expected RoundRobinContainerData but found SingleContainerData for action $actionName")
+              // this should never happen, fail fast
+              logging.error(this, s"Expected RoundRobinContainerData but found SingleContainerData for action $actionName")
+              context.stop(self)
               // Convert SingleContainerData to RoundRobinContainerData with a single container
               val containers = List((actorRef, containerData))
               val updatedContainers = containers
@@ -270,6 +277,8 @@ class ContainerPool(childFactory: ActorRefFactory => ActorRef,
 
         case _ =>
           logging.error(this, s"Unknown scheduling policy: $schedulingPolicy")
+          // fail fast, stop execution
+          context.stop(self)
       }
 
       // Process the next item in the buffer or feed
