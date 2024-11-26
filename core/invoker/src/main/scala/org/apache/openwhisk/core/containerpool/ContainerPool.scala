@@ -134,6 +134,51 @@ class ContainerPool(childFactory: ActorRefFactory => ActorRef,
         logging.info(this, s"******************************************************************************")
         logging.info(this, s"Captured initial Run message for action: ${r.action.fullyQualifiedName(false)}")
         logging.info(this, s"******************************************************************************")
+        logging.info(this, s"Starting containers for policy: $schedulingPolicy")
+        logging.info(this, s"******************************************************************************")
+        // start containers based on scheduling policy
+        val memory = r.action.limits.memory.megabytes.MB
+        schedulingPolicy match {
+          case "SingleContainer" =>
+            // Create only one new container
+            val container = createContainer(memory)
+            val (actorRef, containerData) = container
+            val newData = containerData.nextRun(r)
+            actionContainers = actionContainers + (actionName -> SingleContainerData((actorRef, newData)))
+            // send empty activation --> removes cold start
+            actorRef ! r
+            // cold activation
+            logContainerStart(r, "cold", newData.activeActivationCount, newData.getContainer)
+
+            case "RoundRobin" | "GCMitigation" =>
+            // Create multiple containers based on numContainers
+            val newContainers = (1 to numContainers).map { _ =>
+              createContainer(memory)
+            }.toList
+            // Send empty request to the first container
+            val (actorRef, containerData) = newContainers(0)
+            val newData = containerData.nextRun(r)
+            val updatedContainersWithNewData = newContainers.updated(0, (actorRef, newData))
+            actionContainers = actionContainers + (actionName -> RoundRobinContainerData(
+              updatedContainersWithNewData,
+              1))
+            // send empty activation --> removes cold start
+            actorRef ! r
+            // Send empty activation to second container
+            val (actorRef, containerData) = newContainers(1)
+            val newData = containerData.nextRun(r)
+            val updatedContainersWithNewData = newContainers.updated(1, (actorRef, newData))
+            actionContainers = actionContainers + (actionName -> RoundRobinContainerData(
+              updatedContainersWithNewData,
+              0))
+            // send empty activation --> removes cold start
+            actorRef ! r
+            logContainerStart(r, "cold", newData.activeActivationCount, newData.getContainer)
+
+            // // Add this code to move container from freePool to busyPool
+            // freePool = freePool - actorRef
+            // busyPool = busyPool + (actorRef -> newData)
+        }
       }
       val actionName = r.action.fullyQualifiedName(false)
       schedulingPolicy match {
@@ -188,57 +233,17 @@ class ContainerPool(childFactory: ActorRefFactory => ActorRef,
                   logging.info(this, s"All containers are undergoing GC; buffering request.")
               }
             
-            case Some(SingleContainerData((actorRef, containerData))) =>
-              // Handle unexpected SingleContainerData in GCMitigation policy
-              // this should never happen, fail fast
-              logging.error(this, s"Expected RoundRobinContainerData but found SingleContainerData for action $actionName")
+            case _ =>
+              // Handle unexpected data in GCMitigation policy
+                logging.error(this, s"Expected RoundRobinContainerData but found unexpected data for action $actionName: ${actionContainers(actionName)}")
               // fail fast
               context.stop(self)
-              
-            case None =>
-              // Create initial containers
-              val memory = r.action.limits.memory.megabytes.MB
-              val newContainers = (1 to numContainers).map { _ =>
-                createContainer(memory)
-              }.toList
-              val updatedContainers = newContainers.map { case (actorRef, containerData) => (actorRef, containerData) }
-              val (actorRef, containerData) = updatedContainers(0)
-              val newData = containerData.nextRun(r)
-              val updatedContainersWithNewData = updatedContainers.updated(0, (actorRef, newData))
-              actionContainers = actionContainers + (actionName -> RoundRobinContainerData(updatedContainersWithNewData, 1))
-              actorRef ! r
-              logContainerStart(r, "cold", newData.activeActivationCount, newData.getContainer)
-              // Add this code to move container from freePool to busyPool
-              freePool = freePool - actorRef
-              busyPool = busyPool + (actorRef -> newData)
-          }
-
-        case "SingleContainer" =>
-          actionContainers.get(actionName) match {
-            case Some(SingleContainerData((actorRef, containerData))) =>
-              val newData = containerData.nextRun(r)
-              actionContainers = actionContainers + (actionName -> SingleContainerData((actorRef, newData)))
-              actorRef ! r
-              logContainerStart(r, "existing", newData.activeActivationCount, newData.getContainer)
-              resent = None
-            case Some(otherData) =>
-              logging.warn(this, s"Expected SingleContainerData but found $otherData")
-              // fail fast
-              context.stop(self)
-            case None =>
-              // Create only one new container
-              val memory = r.action.limits.memory.megabytes.MB
-              val container = createContainer(memory)
-              val (actorRef, containerData) = container
-              val newData = containerData.nextRun(r)
-              actionContainers = actionContainers + (actionName -> SingleContainerData((actorRef, newData)))
-              actorRef ! r
-              logContainerStart(r, "cold", newData.activeActivationCount, newData.getContainer)
           }
 
         case "RoundRobin" =>
           actionContainers.get(actionName) match {
             case Some(RoundRobinContainerData(containers, nextIndex)) =>
+              // retrieve the nextIndex container
               val (actorRef, containerData) = containers(nextIndex)
               val newData = containerData.nextRun(r)
               val updatedContainers = containers.updated(nextIndex, (actorRef, newData))
@@ -248,26 +253,28 @@ class ContainerPool(childFactory: ActorRefFactory => ActorRef,
               actorRef ! r
               logContainerStart(r, "existing", newData.activeActivationCount, newData.getContainer)
               resent = None
-            case Some(otherData) =>
-              logging.warn(this, s"Expected RoundRobinContainerData but found $otherData")
+            case _ =>
+              // Handle unexpected data in GCMitigation policy
+                logging.error(this, s"Expected RoundRobinContainerData but found unexpected data for action $actionName: ${actionContainers(actionName)}")
               // fail fast
               context.stop(self)
-            case None =>
-              // Create multiple containers based on numContainers
-              val memory = r.action.limits.memory.megabytes.MB
-              val newContainers = (1 to numContainers).map { _ =>
-                createContainer(memory)
-              }.toList
-              val updatedContainers = newContainers.map { case (actorRef, containerData) => (actorRef, containerData) }
-              // Start with the first container
-              val (actorRef, containerData) = updatedContainers(0)
+          }
+
+
+        case "SingleContainer" =>
+          actionContainers.get(actionName) match {
+            case Some(SingleContainerData((actorRef, containerData))) =>
               val newData = containerData.nextRun(r)
-              val updatedContainersWithNewData = updatedContainers.updated(0, (actorRef, newData))
-              actionContainers = actionContainers + (actionName -> RoundRobinContainerData(
-                updatedContainersWithNewData,
-                1))
+              actionContainers = actionContainers + (actionName -> SingleContainerData((actorRef, newData)))
               actorRef ! r
-              logContainerStart(r, "cold", newData.activeActivationCount, newData.getContainer)
+              // warm activation
+              logContainerStart(r, "existing", newData.activeActivationCount, newData.getContainer)
+              resent = None
+            case _ =>
+              // Handle unexpected data in GCMitigation policy
+                logging.error(this, s"Expected SingleContainerData but found unexpected data for action $actionName: ${actionContainers(actionName)}")
+              // fail fast
+              context.stop(self)
           }
 
         case _ =>
