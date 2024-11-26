@@ -192,16 +192,9 @@ class ContainerPool(childFactory: ActorRefFactory => ActorRef,
               // Handle unexpected SingleContainerData in GCMitigation policy
               // this should never happen, fail fast
               logging.error(this, s"Expected RoundRobinContainerData but found SingleContainerData for action $actionName")
+              // fail fast
               context.stop(self)
-              // Convert SingleContainerData to RoundRobinContainerData with a single container
-              val containers = List((actorRef, containerData))
-              val updatedContainers = containers
-              val updatedNextIndex = 0
-              actionContainers = actionContainers.updated(
-                actionName,
-                RoundRobinContainerData(updatedContainers, updatedNextIndex))
-              self ! r // Retry processing the Run message
-
+              
             case None =>
               // Create initial containers
               val memory = r.action.limits.memory.megabytes.MB
@@ -230,6 +223,8 @@ class ContainerPool(childFactory: ActorRefFactory => ActorRef,
               resent = None
             case Some(otherData) =>
               logging.warn(this, s"Expected SingleContainerData but found $otherData")
+              // fail fast
+              context.stop(self)
             case None =>
               // Create only one new container
               val memory = r.action.limits.memory.megabytes.MB
@@ -255,6 +250,8 @@ class ContainerPool(childFactory: ActorRefFactory => ActorRef,
               resent = None
             case Some(otherData) =>
               logging.warn(this, s"Expected RoundRobinContainerData but found $otherData")
+              // fail fast
+              context.stop(self)
             case None =>
               // Create multiple containers based on numContainers
               val memory = r.action.limits.memory.megabytes.MB
