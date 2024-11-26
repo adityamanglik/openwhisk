@@ -55,7 +55,7 @@ class ContainerPool(childFactory: ActorRefFactory => ActorRef,
   import ContainerPool.memoryConsumptionOf
 
   // Scheduling Policy
-  val schedulingPolicy: String = "GCMitigation" // Changed to "GCMitigation"
+  val schedulingPolicy: String = "SingleContainer" // Changed to "GCMitigation"
   var initialRunMessage: Option[Run] = None
   val numContainers: Int = 2 // Number of containers for RoundRobin policy
 
@@ -128,6 +128,9 @@ class ContainerPool(childFactory: ActorRefFactory => ActorRef,
     // their requests and send them back to the pool for rescheduling (this may happen if "docker" operations
     // fail for example, or a container has aged and was destroying itself when a new request was assigned)
     case r: Run =>
+      val memory = r.action.limits.memory.megabytes.MB
+      val actionName = r.action.fullyQualifiedName(false)
+
       // Capture the initial Run message
       if (initialRunMessage.isEmpty) {
         initialRunMessage = Some(r)
@@ -137,9 +140,6 @@ class ContainerPool(childFactory: ActorRefFactory => ActorRef,
         logging.info(this, s"Starting containers for policy: $schedulingPolicy")
         logging.info(this, s"******************************************************************************")
         // start containers based on scheduling policy
-        val memory = r.action.limits.memory.megabytes.MB
-        val actionName = r.action.fullyQualifiedName(false)
-
         schedulingPolicy match {
           case "SingleContainer" =>
             // Create only one new container
@@ -182,7 +182,7 @@ class ContainerPool(childFactory: ActorRefFactory => ActorRef,
             // busyPool = busyPool + (actorRef -> newData)
         }
       }
-      val actionName = r.action.fullyQualifiedName(false)
+      
       schedulingPolicy match {
         case "GCMitigation" =>
           actionContainers.get(actionName) match {
@@ -273,7 +273,7 @@ class ContainerPool(childFactory: ActorRefFactory => ActorRef,
               logContainerStart(r, "existing", newData.activeActivationCount, newData.getContainer)
               resent = None
             case _ =>
-              // Handle unexpected data in GCMitigation policy
+              // Handle unexpected data in policy
                 logging.error(this, s"Expected SingleContainerData but found unexpected data for action $actionName: ${actionContainers(actionName)}")
               // fail fast
               context.stop(self)
