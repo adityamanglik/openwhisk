@@ -138,6 +138,8 @@ class ContainerPool(childFactory: ActorRefFactory => ActorRef,
         logging.info(this, s"******************************************************************************")
         // start containers based on scheduling policy
         val memory = r.action.limits.memory.megabytes.MB
+        val actionName = r.action.fullyQualifiedName(false)
+
         schedulingPolicy match {
           case "SingleContainer" =>
             // Create only one new container
@@ -165,15 +167,15 @@ class ContainerPool(childFactory: ActorRefFactory => ActorRef,
             // send empty activation --> removes cold start
             actorRef ! r
             // Send empty activation to second container
-            val (actorRef, containerData) = newContainers(1)
-            val newData = containerData.nextRun(r)
-            val updatedContainersWithNewData = newContainers.updated(1, (actorRef, newData))
+            val (actorRef1, containerData1) = newContainers(1)
+            val newData1 = containerData1.nextRun(r)
+            val updatedContainersWithNewData1 = newContainers.updated(1, (actorRef1, newData1))
             actionContainers = actionContainers + (actionName -> RoundRobinContainerData(
-              updatedContainersWithNewData,
+              updatedContainersWithNewData1,
               0))
             // send empty activation --> removes cold start
-            actorRef ! r
-            logContainerStart(r, "cold", newData.activeActivationCount, newData.getContainer)
+            actorRef1 ! r
+            logContainerStart(r, "cold", newData1.activeActivationCount, newData1.getContainer)
 
             // // Add this code to move container from freePool to busyPool
             // freePool = freePool - actorRef
