@@ -54,10 +54,18 @@ class ContainerPool(childFactory: ActorRefFactory => ActorRef,
     extends Actor {
   import ContainerPool.memoryConsumptionOf
 
+  // //////////////////////////////////////////////////
   // Scheduling Policy
-  val schedulingPolicy: String = "SingleContainer" // Changed to "GCMitigation"
+  val schedulingPolicy: String = "GCMitigation" // Changed to "GCMitigation"
   var initialRunMessage: Option[Run] = None
   val numContainers: Int = 2 // Number of containers for RoundRobin policy
+
+  // val requestHeapMargin: Long = 5 * 1024 * 1024L // Configurable margin
+  val heapGrowthSize: Long = 462424 // can be also 470K
+  val nextGCThreshold: Long = 4194304
+  var activationTracker: Int = 0
+  var EMContainerIndex = 0
+  // //////////////////////////////////////////////////
 
   implicit val ec = context.dispatcher
 
@@ -117,9 +125,6 @@ class ContainerPool(childFactory: ActorRefFactory => ActorRef,
       s"containerStart containerState: $containerState container: $container activations: $activeActivations of max $maxConcurrent action: $actionName namespace: $namespaceName activationId: $activationId",
       akka.event.Logging.InfoLevel)
   }
-
-  // Added for GCMitigation policy
-  val requestHeapMargin: Long = 5 * 1024 * 1024L // Configurable margin
 
   def receive: Receive = {
     // A job to run on a container
@@ -187,53 +192,44 @@ class ContainerPool(childFactory: ActorRefFactory => ActorRef,
         case "GCMitigation" =>
           actionContainers.get(actionName) match {
             case Some(RoundRobinContainerData(containers, nextIndex)) =>
-              // Find a container that is not about to undergo GC
-              val suitableContainerOption = containers.find { case (_, data) =>
-                data.gcMetric match {
-                  case Some(gcMetric) =>
-                  val heapAlloc = gcMetric.heapAlloc
-                  val nextGC = gcMetric.nextGC
-                  val margin = requestHeapMargin
-                  val result = (heapAlloc + margin) <= nextGC
-                  logging.info(this, s"******************************************************************************")  
-                  logging.info(this, s"heapAlloc: ${heapAlloc}, nextGC: ${nextGC}, margin: ${margin}")
-                  logging.info(this, s"******************************************************************************")
-                  result
-                  case None =>
-                  true // or false, depending on your policy
-                }
+              // increment activationTracker until 6, then reset
+              activationTracker = activationTracker + 1
+              if (activationTracker == 6) {
+                // TODO: send fake request to current container
+                // val activationRequest = createModifiedRun(r)
+                val (actorRef, containerData) = containers(EMContainerIndex)
+                val newData = containerData.nextRun(r)
+                val updatedContainers = containers.updated(EMContainerIndex, (actorRef, newData))
+                actionContainers =
+                  actionContainers.updated(actionName, RoundRobinContainerData(updatedContainers, EMContainerIndex))
+                actorRef ! r
+                logContainerStart(r, "existing", newData.activeActivationCount, newData.getContainer)
+                // reset activationTracker
+                activationTracker = 0
+                // increment EMContainerIndex
+                EMContainerIndex = (EMContainerIndex + 1) % containers.size
               }
+              // send the activation to the nextIndex container
+              val (actorRef, containerData) = containers(EMContainerIndex)
+              val newData = containerData.nextRun(r)
+              val updatedContainers = containers.updated(EMContainerIndex, (actorRef, newData))
+              // val EMContainerIndex = (nextIndex + 1) % containers.size
+              actionContainers =
+                actionContainers.updated(actionName, RoundRobinContainerData(updatedContainers, EMContainerIndex))
+              actorRef ! r
+              logContainerStart(r, "existing", newData.activeActivationCount, newData.getContainer)
+              resent = None
 
-              suitableContainerOption match {
-                case Some((actorRef, containerData)) =>
-                  // Found a suitable container
-                  val newData = containerData.nextRun(r)
-                  val index = containers.indexWhere { case (ref, _) => ref == actorRef }
-                  if (index >= 0) {
-                    val updatedContainers = containers.updated(index, (actorRef, newData))
-                    val updatedNextIndex = (nextIndex + 1) % containers.size
-                    actionContainers = actionContainers.updated(actionName, RoundRobinContainerData(updatedContainers, updatedNextIndex))
-                    actorRef ! r
-                    logContainerStart(r, "existing", newData.activeActivationCount, newData.getContainer)
-                    // Move container from freePool to busyPool
-                    freePool = freePool - actorRef
-                    busyPool = busyPool + (actorRef -> newData)
-                    resent = None
-                  } else {
-                    // this should never happen, fail fast
-                    logging.error(this, s"Could not find container $actorRef in containers list")
-                    context.stop(self)
-                  }
-                case None =>
-                  // All containers are close to GC, send fake activation to trigger GC
-                  val activationRequest = createModifiedRun(r)
-                  containers.foreach { case (actorRef, containerData) =>
-                    actorRef ! activationRequest
-                  }
-                  // Buffer the request
-                  runBuffer = runBuffer.enqueue(r)
-                  logging.info(this, s"All containers are undergoing GC; buffering request.")
-              }
+              //   case None =>
+              //     // All containers are close to GC, send fake activation to trigger GC
+              //     val activationRequest = createModifiedRun(r)
+              //     containers.foreach { case (actorRef, containerData) =>
+              //       actorRef ! activationRequest
+              //     }
+              //     // Buffer the request
+              //     runBuffer = runBuffer.enqueue(r)
+              //     logging.info(this, s"All containers are undergoing GC; buffering request.")
+              // }
             
             case _ =>
               // Handle unexpected data in GCMitigation policy
