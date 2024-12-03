@@ -56,7 +56,7 @@ class ContainerPool(childFactory: ActorRefFactory => ActorRef,
 
   // //////////////////////////////////////////////////
   // Scheduling Policy
-  val schedulingPolicy: String = "GCMitigation" // Changed to "GCMitigation"
+  val schedulingPolicy: String = "RoundRobin" // Changed to "GCMitigation"
   var initialRunMessage: Option[Run] = None
   val numContainers: Int = 2 // Number of containers for RoundRobin policy
 
