@@ -78,10 +78,10 @@ case class ActivationMessage(override val transid: TransactionId,
  * Message that is sent from the invoker to the controller after action is completed or after slot is free again for
  * new actions.
  */
-abstract class AcknowledegmentMessage(private val tid: TransactionId) extends Message {
+abstract class AcknowledgementMessage(private val tid: TransactionId) extends Message {
   override val transid: TransactionId = tid
 
-  override def serialize: String = AcknowledegmentMessage.serdes.write(this).compactPrint
+  override def serialize: String = AcknowledgementMessage.serdes.write(this).compactPrint
 
   /** Pithy descriptor for logging. */
   def messageType: String
@@ -106,7 +106,7 @@ abstract class AcknowledegmentMessage(private val tid: TransactionId) extends Me
   /**
    * Converts the message to a more compact form if it cannot cross the message bus as is or some of its details are not necessary.
    */
-  def shrink: AcknowledegmentMessage
+  def shrink: AcknowledgementMessage
 }
 
 /**
@@ -115,14 +115,14 @@ abstract class AcknowledegmentMessage(private val tid: TransactionId) extends Me
  * combines the `CompletionMessage` and `ResultMessage`. The `response` may be an `ActivationId` to allow for failures
  * to send the activation result because of event-bus size limitations.
  *
- * The constructor is private so that callers must use the more restrictive constructors which ensure the respose is always
+ * The constructor is private so that callers must use the more restrictive constructors which ensure the response is always
  * Right when this message is created.
  */
 case class CombinedCompletionAndResultMessage private (override val transid: TransactionId,
                                                        response: Either[ActivationId, WhiskActivation],
                                                        override val isSystemError: Option[Boolean],
                                                        instance: InstanceId)
-    extends AcknowledegmentMessage(transid) {
+    extends AcknowledgementMessage(transid) {
   override def messageType = "combined"
 
   override def result = Some(response)
@@ -148,7 +148,7 @@ case class CompletionMessage private (override val transid: TransactionId,
                                       override val activationId: ActivationId,
                                       override val isSystemError: Option[Boolean],
                                       instance: InstanceId)
-    extends AcknowledegmentMessage(transid) {
+    extends AcknowledgementMessage(transid) {
   override def messageType = "completion"
 
   override def result = None
@@ -167,11 +167,11 @@ case class CompletionMessage private (override val transid: TransactionId,
  * This is part of a split phase notification, and does not indicate that the slot is available, which is indicated with
  * a `CompletionMessage`. Note that activation record will not contain any logs from the action execution, only the result.
  *
- * The constructor is private so that callers must use the more restrictive constructors which ensure the respose is always
+ * The constructor is private so that callers must use the more restrictive constructors which ensure the response is always
  * Right when this message is created.
  */
 case class ResultMessage private (override val transid: TransactionId, response: Either[ActivationId, WhiskActivation])
-    extends AcknowledegmentMessage(transid) {
+    extends AcknowledgementMessage(transid) {
   override def messageType = "result"
 
   override def result = Some(response)
@@ -209,7 +209,7 @@ object CombinedCompletionAndResultMessage extends DefaultJsonProtocol {
             instance: InstanceId): CombinedCompletionAndResultMessage =
     new CombinedCompletionAndResultMessage(transid, Right(activation), Some(activation.response.isWhiskError), instance)
 
-  implicit private val eitherSerdes = AcknowledegmentMessage.eitherResponse
+  implicit private val eitherSerdes = AcknowledgementMessage.eitherResponse
   implicit val serdes = jsonFormat4(
     CombinedCompletionAndResultMessage
       .apply(_: TransactionId, _: Either[ActivationId, WhiskActivation], _: Option[Boolean], _: InstanceId))
@@ -239,12 +239,12 @@ object ResultMessage extends DefaultJsonProtocol {
   def apply(transid: TransactionId, activation: WhiskActivation): ResultMessage =
     new ResultMessage(transid, Right(activation))
 
-  implicit private val eitherSerdes = AcknowledegmentMessage.eitherResponse
+  implicit private val eitherSerdes = AcknowledgementMessage.eitherResponse
   implicit val serdes = jsonFormat2(ResultMessage.apply(_: TransactionId, _: Either[ActivationId, WhiskActivation]))
 }
 
-object AcknowledegmentMessage extends DefaultJsonProtocol {
-  def parse(msg: String): Try[AcknowledegmentMessage] = Try(serdes.read(msg.parseJson))
+object AcknowledgementMessage extends DefaultJsonProtocol {
+  def parse(msg: String): Try[AcknowledgementMessage] = Try(serdes.read(msg.parseJson))
 
   protected[connector] val eitherResponse = new JsonFormat[Either[ActivationId, WhiskActivation]] {
     def write(either: Either[ActivationId, WhiskActivation]) = either.fold(_.toJson, _.toJson)
@@ -259,13 +259,13 @@ object AcknowledegmentMessage extends DefaultJsonProtocol {
     }
   }
 
-  implicit val serdes = new RootJsonFormat[AcknowledegmentMessage] {
-    override def write(m: AcknowledegmentMessage): JsValue = m.toJson
+  implicit val serdes = new RootJsonFormat[AcknowledgementMessage] {
+    override def write(m: AcknowledgementMessage): JsValue = m.toJson
 
     // The field invoker is only part of CombinedCompletionAndResultMessage and CompletionMessage.
     // If this field is part of the JSON, we try to deserialize into one of these two types,
     // and otherwise to a ResultMessage. If all conversions fail, an error will be thrown that needs to be handled.
-    override def read(json: JsValue): AcknowledegmentMessage = {
+    override def read(json: JsValue): AcknowledgementMessage = {
       val JsObject(fields) = json
       val completion = fields.contains("instance")
       val result = fields.contains("response")
